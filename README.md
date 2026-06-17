@@ -12,24 +12,35 @@ playback ends.
 
 ## How it works
 
-`keepalive` keeps a single, continuous, **inaudible** audio stream flowing to the
-default output device, so the link never idles and there's no wake/idle transition
-to pop. By default it outputs **pure digital silence** (literal zeros) — inaudible
-by definition. If your headphones need actual signal energy to stay awake, there's
-a fallback to a sub-audible ~20 Hz tone at the noise floor (`--db -90`), still
-inaudible on two counts (level below your headphones' own hiss, frequency where the
-ear barely responds).
+`keepalive` plays a continuous, **inaudible** audio stream to your Bluetooth output
+so the headphones' amp/DAC never idles — that idling is what makes them crackle when
+audio starts or stops. The stream is **pure digital silence** by default (inaudible
+by definition — it's exactly what a "silent" keepalive video plays).
 
-### Idle-aware — it won't block sleep
+Two things make it reliable:
+
+- **It plays through `AVAudioPlayer`** — the high-level media-player API that music,
+  podcast, and browser playback use — rather than a hand-managed audio engine. That's
+  what lets it ride through audio-device / Bluetooth reconfigurations without dropping
+  out (a raw engine gets knocked offline by them and pops).
+- **It only runs on a Bluetooth output.** On built-in speakers, wired output, etc. it
+  goes dormant automatically, and resumes when you switch back to Bluetooth.
+
+A sub-audible ~20 Hz tone is available via `--db` if you ever want real signal instead
+of silence, but it isn't normally needed.
+
+### Sleep-friendly (with a grace window)
 
 An always-on audio stream would stop macOS from idle-sleeping (it treats active
-audio as "media playing"). So `keepalive` watches the system idle timer and
-**releases the stream after a period of inactivity** (default 120s), letting your
-Mac sleep on its normal schedule, then resumes the instant you're active again.
-Manual sleep and closing the lid are never affected.
+audio as "media playing"). So `keepalive` runs while your display is awake, and
+keeps running for a **grace window (default 5 min) after the display sleeps** —
+because the screen often sleeps while you're still around (e.g. listening while
+working on another machine). If you wake the screen within that window, it never
+paused; only after the screen stays off for the full window does it pause, letting
+the Mac idle-sleep. Manual sleep and closing the lid pause it immediately.
 
-Tradeoff: if the headphones idled while you were away, the *first* sound after you
-return may pop once — versus a pop on every start/stop.
+Note: the grace window delays idle sleep by that long on battery (on AC the Mac
+doesn't auto-sleep anyway). Use `--grace 0` to pause the instant the screen sleeps.
 
 ## Install
 
@@ -37,7 +48,6 @@ Requires the Xcode Command Line Tools (`swiftc`).
 
 ```sh
 ./install.sh          # compile, install a LaunchAgent, start at login
-./install.sh 90       # optional: pause after 90s idle instead of 120s
 ```
 
 ## Uninstall
@@ -46,20 +56,30 @@ Requires the Xcode Command Line Tools (`swiftc`).
 ./uninstall.sh
 ```
 
-## Manual control
+## Control
+
+`install.sh` puts a short `hpk` command on your PATH:
 
 ```sh
-# stop now (and at login)
-launchctl bootout gui/$(id -u)/com.$(whoami).headphone-keepalive
-# start again
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.$(whoami).headphone-keepalive.plist
+hpk on            # start now, and at every login
+hpk off           # stop now (until 'hpk on' or next login)
+hpk toggle        # flip on/off
+hpk status        # show ON/OFF + current settings
+
+hpk grace <sec>   # keep running this long after the display sleeps (0 = at once)
+hpk db <dBFS>     # signal level, e.g. -50  (or 'hpk db silence' for pure zeros)
+hpk freq <Hz>     # tone frequency (default 20)
+hpk config        # settings + file paths
 ```
+
+Settings persist in `~/.config/headphone-keepalive.conf`, apply live (it reloads if
+running), and survive logins.
 
 ## Options
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--idle-stop <sec>` | `120` | Pause after this many seconds idle (`0` = never; always on) |
+| `--grace <sec>` | `300` | Keep running this long after the display sleeps before pausing (`0` = pause immediately) |
 | `--db <dBFS>` | off | Emit a sub-audible tone at this level instead of pure silence |
 | `--freq <Hz>` | `20` | Tone frequency when `--db` is used |
 | `--quiet` | — | Suppress the periodic heartbeat log line |

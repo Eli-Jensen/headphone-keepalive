@@ -1,171 +1,204 @@
-// keepalive — keeps a continuous, inaudible audio stream flowing to the default
-// output device so Bluetooth headphones (e.g. Bose QC) never idle their amp/DAC
-// and therefore never produce the start/stop crackle.
+// keepalive — keeps inaudible audio flowing to the default output so Bluetooth
+// headphones (e.g. Bose QC) never idle their amp/DAC and pop when audio starts/stops.
 //
-// Idle-aware: pauses the stream after a period of user inactivity so the Mac can
-// idle-sleep on its normal schedule, and resumes the instant you're active again.
-// It only holds an audio stream (which is what makes macOS prevent idle sleep)
-// while you're actually using the machine — and an active user already prevents
-// idle sleep anyway. Manual sleep / closing the lid is never affected.
+// Plays a looping file through AVAudioPlayer — the high-level media-player API that
+// music/podcast apps use — rather than a hand-managed AVAudioEngine graph, so it rides
+// through audio-device / Bluetooth reconfigurations the way a browser media element does.
+//
+// Only runs when the active output is a Bluetooth device (that's the only case the
+// crackle affects); goes dormant on built-in speakers, wired output, etc.
+//
+// Sleep-friendly: pauses a grace window after the display sleeps; resumes on wake.
 //
 // Usage:
-//   keepalive                      pure digital silence; pause after 120s idle
-//   keepalive --idle-stop 90       pause after 90s of inactivity
-//   keepalive --idle-stop 0        never pause (always on; this WILL block idle sleep)
-//   keepalive --db -90 --freq 20   sub-audible tone fallback instead of pure silence
+//   keepalive                      pure silence; pause 5 min after display sleep
+//   keepalive --grace 60           pause 60s after the display sleeps (0 = at once)
+//   keepalive --db -50 --freq 20   sub-audible tone instead of silence
 //   keepalive --quiet              suppress the periodic heartbeat log
 
 import AVFoundation
 import Foundation
-import IOKit
 import AppKit
+import CoreGraphics
+import CoreAudio
 
-// ---- Parse args ----
-var dbfs: Double? = nil       // nil => pure digital silence
-var freq: Double = 20.0       // Hz; sub-bass, where the ear is least sensitive
-var quiet = false             // suppress the periodic heartbeat
-var idleStop: Double = 120    // seconds of inactivity before pausing (0 = never)
+// ---- Args ----
+var dbfs: Double? = nil
+var freq: Double = 20.0
+var quiet = false
+var grace: Double = 300
 
 var args = Array(CommandLine.arguments.dropFirst())
 var i = 0
 while i < args.count {
     switch args[i] {
-    case "--db":
-        i += 1
-        if i < args.count, let v = Double(args[i]) { dbfs = v }
-    case "--freq":
-        i += 1
-        if i < args.count, let v = Double(args[i]) { freq = v }
-    case "--idle-stop":
-        i += 1
-        if i < args.count, let v = Double(args[i]) { idleStop = v }
-    case "--silence":
-        dbfs = nil
-    case "--quiet":
-        quiet = true
-    default:
-        FileHandle.standardError.write("keepalive: ignoring unknown arg \(args[i])\n".data(using: .utf8)!)
+    case "--db":    i += 1; if i < args.count, let v = Double(args[i]) { dbfs = v }
+    case "--freq":  i += 1; if i < args.count, let v = Double(args[i]) { freq = v }
+    case "--grace": i += 1; if i < args.count, let v = Double(args[i]) { grace = v }
+    case "--silence": dbfs = nil
+    case "--quiet":   quiet = true
+    default: FileHandle.standardError.write("keepalive: ignoring unknown arg \(args[i])\n".data(using: .utf8)!)
     }
     i += 1
 }
-
 let amplitude: Double = dbfs.map { pow(10.0, $0 / 20.0) } ?? 0.0
 
-// ---- System idle time: nanoseconds since last HID (keyboard/mouse) event ----
-func systemIdleSeconds() -> Double {
-    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
-    if service == 0 { return 0 }
-    defer { IOObjectRelease(service) }
-    guard let cf = IORegistryEntryCreateCFProperty(service, "HIDIdleTime" as CFString,
-                                                   kCFAllocatorDefault, 0)?.takeRetainedValue(),
-          let num = cf as? NSNumber else { return 0 }
-    return num.doubleValue / 1_000_000_000.0
+// ---- Timestamped logging ----
+let logTimeFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f }()
+func log(_ s: String) { print("\(logTimeFmt.string(from: Date())) \(s)") }
+setbuf(stdout, nil)
+
+// ---- CoreAudio: is the current default output a Bluetooth device? ----
+func defaultOutputDevice() -> AudioDeviceID {
+    var dev = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev)
+    return dev
+}
+func deviceTransport(_ dev: AudioDeviceID) -> UInt32 {
+    var t = UInt32(0)
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &t)
+    return t
+}
+func deviceName(_ dev: AudioDeviceID) -> String {
+    var name: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
+                                          mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    if AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &name) == noErr,
+       let n = name?.takeRetainedValue() { return n as String }
+    return "output \(dev)"
+}
+func outputIsBluetooth() -> Bool {
+    let dev = defaultOutputDevice()
+    if dev == 0 { return false }
+    let t = deviceTransport(dev)
+    return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
 }
 
-// ---- Signal generator (state lives on the audio render thread) ----
-final class Generator {
-    let amplitude: Double
-    let phaseInc: Double
-    var phase: Double = 0
-    var renderedFrames: Int = 0   // diagnostic counter (benign cross-thread read)
-
-    init(amplitude: Double, freq: Double, sampleRate: Double) {
-        self.amplitude = amplitude
-        self.phaseInc = 2.0 * Double.pi * freq / sampleRate
+// ---- Build a short loop file: silence, or an integer number of tone cycles (seamless) ----
+func makeLoopURL() throws -> URL {
+    let sr = 44100.0
+    let target = 10.0
+    let frames: Int
+    if amplitude == 0.0 || freq <= 0 {
+        frames = Int(sr * target)
+    } else {
+        let cycles = max(1.0, (target * freq).rounded())
+        frames = Int((cycles * sr / freq).rounded())
     }
-
-    func render(_ frameCount: AVAudioFrameCount, _ abl: UnsafeMutableAudioBufferListPointer) {
-        if amplitude == 0.0 {
-            for buf in abl { memset(buf.mData, 0, Int(buf.mDataByteSize)) }
-        } else {
-            let twoPi = 2.0 * Double.pi
-            for frame in 0..<Int(frameCount) {
-                let sample = Float(amplitude * sin(phase))
-                phase += phaseInc
-                if phase >= twoPi { phase -= twoPi }
-                for buf in abl {
-                    buf.mData!.assumingMemoryBound(to: Float.self)[frame] = sample
-                }
-            }
+    let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sr, channels: 2, interleaved: false)!
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frames))!
+    buf.frameLength = AVAudioFrameCount(frames)
+    let c0 = buf.floatChannelData![0]
+    let c1 = buf.floatChannelData![1]
+    if amplitude == 0.0 {
+        for n in 0..<frames { c0[n] = 0; c1[n] = 0 }
+    } else {
+        let twoPi = 2.0 * Double.pi
+        let inc = twoPi * freq / sr
+        var ph = 0.0
+        for n in 0..<frames {
+            let s = Float(amplitude * sin(ph))
+            c0[n] = s; c1[n] = s
+            ph += inc; if ph >= twoPi { ph -= twoPi }
         }
-        renderedFrames += Int(frameCount)
+    }
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("keepalive-loop.wav")
+    let settings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: sr, AVNumberOfChannelsKey: 2,
+        AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false
+    ]
+    let file = try AVAudioFile(forWriting: url, settings: settings)
+    try file.write(from: buf)
+    return url
+}
+
+// ---- Player ----
+let player: AVAudioPlayer
+do {
+    player = try AVAudioPlayer(contentsOf: try makeLoopURL())
+} catch {
+    FileHandle.standardError.write("keepalive: setup failed: \(error)\n".data(using: .utf8)!)
+    exit(1)
+}
+player.numberOfLoops = -1
+player.volume = 1.0
+player.prepareToPlay()
+
+// Play only when present (display awake / grace) AND the output is Bluetooth.
+var awake = true
+func shouldPlay() -> Bool { awake && outputIsBluetooth() }
+func reconcile(_ reason: String) {
+    if shouldPlay() {
+        if !player.isPlaying { player.play(); log("[keepalive] play ON  (\(reason))") }
+    } else {
+        if player.isPlaying { player.pause(); log("[keepalive] play OFF (\(reason))") }
     }
 }
 
-// ---- Engine setup ----
-let engine = AVAudioEngine()
-let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
-let gen = Generator(amplitude: amplitude, freq: freq, sampleRate: format.sampleRate)
-
-let srcNode = AVAudioSourceNode(format: format) { _, _, frameCount, ablPointer -> OSStatus in
-    gen.render(frameCount, UnsafeMutableAudioBufferListPointer(ablPointer))
-    return noErr
+// ---- React to output-device changes (connect/disconnect/switch) ----
+var outAddr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                         mScope: kAudioObjectPropertyScopeGlobal,
+                                         mElement: kAudioObjectPropertyElementMain)
+AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &outAddr, DispatchQueue.main) { _, _ in
+    let dev = defaultOutputDevice()
+    log("[keepalive] output → \(deviceName(dev)) (\(outputIsBluetooth() ? "Bluetooth" : "not Bluetooth"))")
+    reconcile("output changed")
 }
 
-engine.attach(srcNode)
-engine.connect(srcNode, to: engine.mainMixerNode, format: format)
-
-func startEngineIfNeeded(_ reason: String) {
-    guard !engine.isRunning else { return }
-    do {
-        try engine.start()
-        print("[keepalive] stream ON  (\(reason))")
-    } catch {
-        FileHandle.standardError.write("keepalive: failed to start engine: \(error)\n".data(using: .utf8)!)
+// ---- Grace timer: pause only after the display has been off `grace` seconds ----
+var graceTimer: Timer?
+func armGrace() {
+    graceTimer?.invalidate()
+    if grace <= 0 { awake = false; reconcile("display off"); return }
+    graceTimer = Timer.scheduledTimer(withTimeInterval: grace, repeats: false) { _ in
+        awake = false; reconcile("display off \(Int(grace))s+")
     }
 }
+func cancelGrace() { graceTimer?.invalidate(); graceTimer = nil }
 
-func stopEngineIfNeeded(_ reason: String) {
-    guard engine.isRunning else { return }
-    engine.stop()
-    print("[keepalive] stream OFF (\(reason))")
-}
-
-// Re-engage on audio config change (output device switch / wake) — but only if the
-// user is active, so a device change while idle doesn't defeat idle-sleep.
-NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-                                       object: engine, queue: .main) { _ in
-    if idleStop <= 0 || systemIdleSeconds() < idleStop {
-        startEngineIfNeeded("audio config changed")
-    }
-}
-
-// ---- Sleep / wake (covers manual sleep & lid close) ----
 let wsnc = NSWorkspace.shared.notificationCenter
+wsnc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { _ in
+    if grace > 0 { log("[keepalive] display slept — holding \(Int(grace))s before pausing") }
+    armGrace()
+}
+wsnc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { _ in
+    cancelGrace(); awake = true; reconcile("display woke")
+}
 wsnc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
-    stopEngineIfNeeded("system sleeping")
+    cancelGrace(); awake = false; reconcile("system sleeping")
 }
 wsnc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
-    startEngineIfNeeded("system woke")
+    cancelGrace(); awake = true; reconcile("system woke")
 }
 
-setbuf(stdout, nil)  // unbuffered so log lines flush immediately
-
+// ---- Banner + start ----
 let mode = amplitude == 0.0
     ? "PURE DIGITAL SILENCE (zeros)"
-    : String(format: "%.0f Hz tone @ %.1f dBFS (amplitude %.6g)", freq, dbfs ?? 0, amplitude)
-let idleDesc = idleStop <= 0 ? "never (always on)" : String(format: "%.0fs inactivity", idleStop)
-print("[keepalive] starting — mode: \(mode); pause after: \(idleDesc)")
-startEngineIfNeeded("startup")
+    : String(format: "%.0f Hz tone @ %.1f dBFS", freq, dbfs ?? 0)
+let graceDesc = grace <= 0 ? "on display sleep"
+    : (grace.truncatingRemainder(dividingBy: 60) == 0 ? "\(Int(grace / 60)) min after display sleep"
+                                                       : "\(Int(grace))s after display sleep")
+log("[keepalive] starting — AVAudioPlayer; \(mode); Bluetooth-output only; pauses: \(graceDesc)")
 
-// ---- Idle poll: pause when inactive (lets the Mac idle-sleep), resume on activity ----
-if idleStop > 0 {
-    Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
-        if systemIdleSeconds() >= idleStop {
-            stopEngineIfNeeded("idle \(Int(idleStop))s+")
-        } else {
-            startEngineIfNeeded("active")
-        }
-    }
-}
+awake = true
+if CGDisplayIsAsleep(CGMainDisplayID()) != 0 { armGrace() }
+let dev0 = defaultOutputDevice()
+log("[keepalive] output is \(deviceName(dev0)) (\(outputIsBluetooth() ? "Bluetooth" : "not Bluetooth"))")
+reconcile("startup")
 
-// Heartbeat: proves the stream is live while running.
-var lastFrames = 0
+// ---- Heartbeat ----
 func heartbeat() {
-    let now = gen.renderedFrames
-    let delta = now - lastFrames
-    lastFrames = now
-    print("[keepalive] alive — running=\(engine.isRunning) totalFrames=\(now) (+\(delta) since last check)")
+    log("[keepalive] alive — playing=\(player.isPlaying) t=\(String(format: "%.1f", player.currentTime))s output=\(outputIsBluetooth() ? "BT" : "non-BT")")
 }
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { _ in heartbeat() }
 if !quiet {

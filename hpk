@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# hpk — control for headphone-keepalive
+set -euo pipefail
+
+LABEL="com.$(whoami).headphone-keepalive"
+DOMAIN="gui/$(id -u)"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+CONF="$HOME/.config/headphone-keepalive.conf"
+
+# Resolve our own location (through the PATH symlink) to find the repo + binary.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"
+  case "$link" in
+    /*) SELF="$link" ;;
+    *)  SELF="$(cd "$(dirname "$SELF")" && pwd)/$link" ;;
+  esac
+done
+REPO_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+BIN="$REPO_DIR/keepalive"
+LOG="$REPO_DIR/keepalive.log"
+
+# Settings — defaults, overridden by the config file if present.
+DB="-50"; FREQ="20"; GRACE="300"
+if [ -f "$CONF" ]; then . "$CONF"; fi
+
+is_on()  { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+is_num() { [[ "${1:-}" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; }
+
+bring_up() {
+  # bootout is async; retry bootstrap to ride out the launchd teardown race (EIO 5)
+  for _ in 1 2 3 4 5 6 7 8; do
+    launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+save_conf() {
+  mkdir -p "$(dirname "$CONF")"
+  { echo "DB=$DB"; echo "FREQ=$FREQ"; echo "GRACE=$GRACE"; } > "$CONF"
+}
+
+sig_desc() {
+  if [ "$DB" = "silence" ]; then echo "pure silence"; else echo "${DB} dBFS @ ${FREQ} Hz"; fi
+}
+
+write_plist() {
+  local sig
+  if [ "$DB" = "silence" ]; then
+    sig="        <string>--silence</string>"
+  else
+    sig="        <string>--db</string>
+        <string>$DB</string>
+        <string>--freq</string>
+        <string>$FREQ</string>"
+  fi
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$BIN</string>
+        <string>--quiet</string>
+        <string>--grace</string>
+        <string>$GRACE</string>
+$sig
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>$LOG</string>
+    <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+EOF
+}
+
+# Regenerate the plist from current settings; reload only if it's running.
+apply() {
+  write_plist
+  if is_on; then
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    bring_up || { echo "hpk: reload failed" >&2; return 1; }
+  fi
+}
+
+applied_note() { if is_on; then echo "(reloaded)"; else echo "(applies next 'hpk on')"; fi; }
+
+usage() {
+  local state; if is_on; then state="ON"; else state="OFF"; fi
+  cat <<EOF
+hpk — headphone-keepalive control   (currently: $state)
+
+  hpk on             start now, and at every login
+  hpk off            stop now (until 'hpk on' or next login)
+  hpk toggle         flip on/off
+  hpk status         show ON/OFF + current settings
+
+  hpk grace <sec>    keep running this long after the display sleeps (0 = pause at once)
+  hpk db <dBFS>      signal level, e.g. -50   (or 'hpk db silence' for pure zeros)
+  hpk freq <Hz>      tone frequency (default 20)
+  hpk config         show current settings
+  hpk help           show this help
+
+Now: $(sig_desc), grace ${GRACE}s. Setting changes apply live and persist across logins.
+EOF
+}
+
+case "${1:-help}" in
+  on|start)
+    if is_on; then echo "keepalive: already ON"
+    else write_plist; if bring_up; then echo "keepalive: ON"; else echo "keepalive: failed to start" >&2; exit 1; fi; fi ;;
+  off|stop)
+    if is_on; then launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; echo "keepalive: OFF"
+    else echo "keepalive: already OFF"; fi ;;
+  toggle)
+    if is_on; then launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; echo "keepalive: OFF"
+    else write_plist; if bring_up; then echo "keepalive: ON"; else echo "keepalive: failed" >&2; exit 1; fi; fi ;;
+  status)
+    if is_on; then
+      echo "keepalive: ON"
+      echo "  signal: $(sig_desc)"
+      echo "  grace:  ${GRACE}s after display sleep"
+      echo "  output: Bluetooth only"
+    else
+      echo "keepalive: OFF"
+    fi ;;
+  grace)
+    is_num "${2:-}" || { echo "usage: hpk grace <seconds>   (e.g. 60; 0 = pause immediately)" >&2; exit 1; }
+    GRACE="$2"; save_conf; apply
+    echo "grace = ${GRACE}s $(applied_note)" ;;
+  db)
+    if [ "${2:-}" = "silence" ] || [ "${2:-}" = "off" ]; then DB="silence"
+    elif is_num "${2:-}"; then DB="$2"
+    else echo "usage: hpk db <dBFS like -50>   or   hpk db silence" >&2; exit 1; fi
+    save_conf; apply
+    echo "signal = $(sig_desc) $(applied_note)" ;;
+  freq)
+    is_num "${2:-}" || { echo "usage: hpk freq <Hz>   (e.g. 20)" >&2; exit 1; }
+    FREQ="$2"; save_conf; apply
+    echo "signal = $(sig_desc) $(applied_note)" ;;
+  config|show)
+    echo "signal:  $(sig_desc)"
+    echo "grace:   ${GRACE}s after display sleep"
+    echo "state:   $(if is_on; then echo ON; else echo OFF; fi)"
+    echo "binary:  $BIN"
+    echo "plist:   $PLIST"
+    echo "config:  $CONF" ;;
+  apply)  # internal: regenerate the plist from settings (used by install.sh)
+    apply; echo "applied: $(sig_desc), grace ${GRACE}s" ;;
+  help|-h|--help)
+    usage ;;
+  *)
+    echo "hpk: unknown command '${1}'" >&2; echo >&2; usage >&2; exit 1 ;;
+esac
