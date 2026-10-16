@@ -4,10 +4,12 @@
 
 Some Bluetooth headphones (Bose QuietComfort especially) make a burst of static, a
 crackle, or a pop every time audio *starts* or *stops*: a notification chime, pausing
-a video, the gap between songs, unmuting on a call. `headphone-keepalive` is a tiny
-background tool that makes that go away by never letting the audio go quiet in the
-first place. You can't hear it, it doesn't block sleep, and it only runs while
-Bluetooth headphones are the active output.
+a video, the gap between songs, unmuting on a call. That noise is the headphones' DAC
+and amplifier powering on and off, over and over throughout the day, to save battery
+whenever audio stops. `headphone-keepalive` is a tiny background tool that keeps that
+circuit always active by never letting the audio go quiet in the first place. You
+can't hear it, it doesn't block sleep, and it only runs while Bluetooth headphones are
+the active output.
 
 ```sh
 git clone https://github.com/Eli-Jensen/headphone-keepalive.git
